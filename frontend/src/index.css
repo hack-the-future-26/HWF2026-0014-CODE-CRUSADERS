@@ -1,0 +1,73 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-800 font-sans antialiased selection:bg-sky-100 selection:text-sky-900 min-h-screen;
+    background-image: 
+      radial-gradient(at 100% 0%, rgba(224, 242, 254, 0.45) 0px, transparent 50%),
+      radial-gradient(at 0% 100%, rgba(240, 249, 255, 0.6) 0px, transparent 50%);
+  }
+}
+
+/* Custom modern scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #F1F5F9;
+}
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* Scanning laser line animation */
+@keyframes laserScan {
+  0% {
+    top: 0%;
+    opacity: 0.8;
+  }
+  50% {
+    opacity: 1;
+  }
+  100% {
+    top: 100%;
+    opacity: 0.8;
+  }
+}
+
+.animate-laser {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, #0EA5E9, #38BDF8, #0EA5E9, transparent);
+  box-shadow: 0 0 15px 3px rgba(14, 165, 233, 0.8);
+  animation: laserScan 2s ease-in-out infinite alternate;
+}
+
+/* Subtle pulse glow */
+@keyframes radarSweep {
+  0% {
+    transform: scale(0.95);
+    opacity: 0.5;
+  }
+  50% {
+    transform: scale(1.05);
+    opacity: 0.8;
+  }
+  100% {
+    transform: scale(0.95);
+    opacity: 0.5;
+  }
+}
+
+.radar-glow {
+  animation: radarSweep 3s ease-in-out infinite;
+}
