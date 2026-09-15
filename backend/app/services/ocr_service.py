@@ -203,10 +203,10 @@ class OCRService:
                 r'(?:^|[\s\.\:\-\#])(?:DATE\s*OF\s*BIRTH|D\.?O\.?B\.?|BIRTH\s*DATE|DOB\b|DATE\s*DE\s*NAISSANCE|FECHA\s*DE\s*NACIMIENTO|NATAL\b)',
             ],
             "Issue Date": [
-                r'(?:^|[\s\.\:\-\#])(?:ISSUE\s*DATE|DATE\s*OF\s*ISSUE|ISSUED\b|ISS\.?\s*DATE|DATE\s*D[\'’]EMISSION|FECHA\s*DE\s*EXPEDICION)',
+                r'(?:^|[\s\.\:\-\#])(?:ISSUE\s*DATE|DATE\s*OF\s*ISSUE|ISSUED\b|ISS\.?\s*DATE|ISSUE\b|DATE\s*D[\'’]EMISSION|FECHA\s*DE\s*EXPEDICION)',
             ],
             "Expiry Date": [
-                r'(?:^|[\s\.\:\-\#])(?:EXPIRY\s*DATE|EXPIRATION\s*DATE|EXPIRES\b|EXP\.?\s*DATE|EXP\b|VALID\s*(?:UNTIL|THRU|TO)|FECHA\s*DE\s*VENCIMIENTO|EXPIRATION\b)',
+                r'(?:^|[\s\.\:\-\#])(?:EXPIRY\s*DATE|EXPIRATION\s*DATE|EXPIRES\b|EXP\.?\s*DATE|EXPIRY\b|EXP\b|VALID\s*(?:UNTIL|THRU|TO)|FECHA\s*DE\s*VENCIMIENTO|EXPIRATION\b)',
             ],
             "Address": [
                 r'(?:^|[\s\.\:\-\#])(?:ADDRESS|ADDR\.?|RESIDENTIAL\s*ADDRESS|PERMANENT\s*ADDRESS|PRESENT\s*ADDRESS|DOMICILE|DIRECCION|ADRESSE|STREET\s*ADDRESS)',
@@ -233,75 +233,326 @@ class OCRService:
             y1 = min(t.get("min_y", t["bbox"][1]) for t in token_list)
             x2 = max(t.get("max_x", t["bbox"][0] + t["bbox"][2]) for t in token_list)
             y2 = max(t.get("max_y", t["bbox"][1] + t["bbox"][3]) for t in token_list)
-            return [int(x1), int(y1), int(x2 - x1), int(y2 - y1)]
+            return [int(x1), int(y1), int(max(1, x2 - x1)), int(max(1, y2 - y1))]
 
+        # Ensure spatial boundary coordinates on all tokens
+        for line in lines:
+            for t in line:
+                if "min_x" not in t:
+                    t["min_x"] = t["bbox"][0]
+                if "min_y" not in t:
+                    t["min_y"] = t["bbox"][1]
+                if "max_x" not in t:
+                    t["max_x"] = t["min_x"] + t["bbox"][2]
+                if "max_y" not in t:
+                    t["max_y"] = t["min_y"] + t["bbox"][3]
+                if "center_x" not in t:
+                    t["center_x"] = (t["min_x"] + t["max_x"]) / 2.0
+                if "center_y" not in t:
+                    t["center_y"] = (t["min_y"] + t["max_y"]) / 2.0
+
+        def evaluate_candidate_format(field_name: str, raw_text: str) -> Tuple[bool, float, str]:
+            """
+            Evaluate whether candidate text conforms to expected format for field_name.
+            Returns (is_valid, format_score, normalized_value).
+            """
+            cleaned = raw_text.strip(" :-,#.")
+            if not cleaned:
+                return False, -100.0, ""
+
+            if is_any_label(cleaned):
+                return False, -100.0, cleaned
+
+            if is_boilerplate(cleaned):
+                return False, -100.0, cleaned
+
+            if field_name == "Full Name":
+                # Separate camelCase (e.g. LaxmiSingh -> Laxmi Singh)
+                sep = re.sub(r'([a-z])([A-Z])', r'\1 \2', cleaned)
+                # Remove stray characters except letters, apostrophes, hyphens, spaces, periods
+                clean_name = re.sub(r'[^A-Za-z\s\.\'-]', '', sep).strip()
+                # Names cannot contain digits, emails, or web urls
+                if re.search(r'[\d@]|https?://|www\.', cleaned):
+                    return False, -100.0, clean_name
+                words = [w for w in clean_name.split() if len(w) >= 2]
+                if not words:
+                    return False, -100.0, clean_name
+                # Must be primarily alphabetic
+                if not all(re.match(r"^[A-Za-z\.\'-]+$", w) for w in words):
+                    return False, -80.0, clean_name
+                # Exclude administrative/governmental keywords
+                state_words = {
+                    "REPUBLIC", "STATE", "DEPARTMENT", "COLLEGE", "UNIVERSITY", "GOVERNMENT",
+                    "IDENTITY", "CARD", "DRIVER", "LICENSE", "LICENCE", "UNION", "AUTHORITY",
+                    "NATIONAL", "OFFICIAL", "SPECIMEN", "SAMPLE", "DEMO", "PERMIT"
+                }
+                if any(w.upper() in state_words for w in words):
+                    return False, -100.0, clean_name
+
+                # 2 to 5 alphabetic words
+                if 2 <= len(words) <= 5:
+                    return True, 45.0, clean_name
+                elif len(words) == 1:
+                    if len(words[0]) >= 3:
+                        return True, 15.0, clean_name
+                    return False, -30.0, clean_name
+                else:
+                    return False, -50.0, clean_name
+
+            elif field_name in ("Date of Birth", "Issue Date", "Expiry Date"):
+                # Supported formats: DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY, YYYY-MM-DD
+                m_ymd = re.search(r'\b(19\d{2}|20\d{2})[-/.](0?[1-9]|1[012])[-/.](0?[1-9]|[12][0-9]|3[01])\b', cleaned)
+                m_dmy = re.search(r'\b(0?[1-9]|[12][0-9]|3[01])[-/.](0?[1-9]|1[012])[-/.](19\d{2}|20\d{2})\b', cleaned)
+
+                if m_ymd:
+                    y, m, d = m_ymd.group(1), int(m_ymd.group(2)), int(m_ymd.group(3))
+                    return True, 45.0, f"{y}-{m:02d}-{d:02d}"
+                elif m_dmy:
+                    d, m, y = int(m_dmy.group(1)), int(m_dmy.group(2)), m_dmy.group(3)
+                    return True, 45.0, f"{y}-{m:02d}-{d:02d}"
+                else:
+                    return False, -80.0, cleaned
+
+            elif field_name == "ID Number":
+                # Must not be a date
+                if re.search(r'^\d{2,4}[-/.]\d{2}[-/.]\d{2,4}$', cleaned):
+                    return False, -90.0, cleaned
+                clean_id = re.sub(r'[^A-Z0-9\-\s]', '', cleaned.upper()).strip()
+                if len(clean_id) < 4:
+                    return False, -60.0, clean_id
+                id_patterns = [
+                    r'^[A-Z0-9]{2,6}-[0-9A-Z]{4,12}(?:-[0-9A-Z]{2,6})?$',
+                    r'^[A-Z]{1,4}[0-9]{5,12}$',
+                    r'^[A-Z]{3,4}-[0-9]{4,6}-[0-9]{4,6}$',
+                    r'^\d{4}\s\d{4}\s\d{4}$',
+                    r'^[A-Z0-9]{5,18}$'
+                ]
+                has_digit = any(c.isdigit() for c in clean_id)
+                if any(re.match(p, clean_id) for p in id_patterns) and has_digit:
+                    return True, 45.0, clean_id
+                elif has_digit and len(clean_id) >= 4:
+                    return True, 35.0, clean_id
+                else:
+                    return False, -50.0, clean_id
+
+            elif field_name == "Gender":
+                u = cleaned.upper().strip(" .:")
+                if u in {"M", "F", "MALE", "FEMALE", "OTHER"}:
+                    return True, 45.0, u
+                if u in {"M/", "/M", "F/", "/F"}:
+                    return True, 35.0, "M" if "M" in u else "F"
+                return False, -50.0, cleaned
+
+            elif field_name == "Nationality":
+                sep = re.sub(r'([a-z])([A-Z])', r'\1 \2', cleaned)
+                clean_nat = re.sub(r'[^A-Za-z\s]', '', sep).strip()
+                words = clean_nat.split()
+                if 1 <= len(words) <= 3 and all(len(w) >= 2 for w in words):
+                    return True, 40.0, clean_nat
+                return False, -40.0, cleaned
+
+            elif field_name == "Address":
+                sep = re.sub(r'([a-z])([A-Z])', r'\1 \2', cleaned)
+                sep = re.sub(r'([0-9])([A-Za-z])', r'\1 \2', sep)
+                sep = re.sub(r'([A-Za-z])([0-9])', r'\1 \2', sep)
+                clean_addr = re.sub(r'[^A-Za-z0-9\s\.\,\#\/\-]', '', sep).strip()
+                if len(clean_addr) >= 5:
+                    return True, 35.0, clean_addr
+                return False, -40.0, cleaned
+
+            elif field_name == "Document Type":
+                if len(cleaned) >= 3:
+                    return True, 30.0, cleaned
+                return False, -30.0, cleaned
+
+            return True, 20.0, cleaned
 
         # -------------------------------------------------------------
-        # PASS 1: Line-by-Line Label Search & Multi-Token Field Extraction
+        # PASS 1: Spatial / Line-Aware Candidate Scoring & Field Extraction
         # -------------------------------------------------------------
+        # Step 1.1: Locate all labels on each line
+        label_occurrences = []
         for line_idx, line in enumerate(lines):
             line_text = " ".join(t["text"].strip() for t in line)
             line_upper = line_text.upper()
 
-            for field_name, patterns in LABEL_PATTERNS.items():
-                if parsed[field_name]["value"] != "Not detected":
-                    continue
-
+            for f_name, patterns in LABEL_PATTERNS.items():
                 for pat in patterns:
-                    m = re.search(pat, line_upper)
-                    if not m:
-                        continue
+                    for m in re.finditer(pat, line_upper):
+                        matched_start = m.start()
+                        matched_end = m.end()
 
-                    # Label pattern matched in this line!
-                    matched_end = m.end()
+                        # Map character offsets to tokens in this line
+                        char_count = 0
+                        start_tok_idx = 0
+                        end_tok_idx = 0
+                        inline_remainder = ""
 
-                    # Find which token in the line contained the end of the match
-                    char_count = 0
-                    label_token_idx = 0
-                    inline_remainder = ""
-                    for idx, tok in enumerate(line):
-                        tok_len = len(tok["text"])
-                        if char_count + tok_len >= matched_end:
-                            label_token_idx = idx
-                            offset_in_tok = matched_end - char_count
-                            inline_remainder = tok["text"][offset_in_tok:].strip().lstrip(": -#.")
-                            break
-                        char_count += tok_len + 1  # account for space
+                        for idx, tok in enumerate(line):
+                            tok_len = len(tok["text"])
+                            tok_start = char_count
+                            tok_end = char_count + tok_len
 
-                    # Collect candidate tokens on current line
-                    val_tokens: List[Dict[str, Any]] = []
-                    if inline_remainder and not is_boilerplate(inline_remainder):
-                        # Create pseudo token or use remainder text
-                        val_tokens.append({
-                            "text": inline_remainder,
-                            "conf": line[label_token_idx]["conf"],
-                            "min_x": line[label_token_idx]["min_x"],
-                            "min_y": line[label_token_idx]["min_y"],
-                            "max_x": line[label_token_idx]["bbox"][0] + line[label_token_idx]["bbox"][2],
-                            "max_y": line[label_token_idx]["bbox"][1] + line[label_token_idx]["bbox"][3],
-                            "bbox": line[label_token_idx]["bbox"]
+                            if tok_start <= matched_start < tok_end:
+                                start_tok_idx = idx
+                            if tok_start < matched_end <= tok_end:
+                                end_tok_idx = idx
+                                offset_in_tok = matched_end - tok_start
+                                inline_remainder = tok["text"][offset_in_tok:].strip().lstrip(": -#.")
+                                break
+                            elif matched_end > tok_end and idx == len(line) - 1:
+                                end_tok_idx = idx
+
+                            char_count += tok_len + 1
+
+                        label_toks = line[start_tok_idx:end_tok_idx + 1]
+                        l_bbox = make_merged_bbox(label_toks)
+
+                        label_occurrences.append({
+                            "field_name": f_name,
+                            "pattern": pat,
+                            "line_idx": line_idx,
+                            "start_tok_idx": start_tok_idx,
+                            "end_tok_idx": end_tok_idx,
+                            "inline_remainder": inline_remainder,
+                            "bbox": l_bbox,
+                            "min_x": l_bbox[0],
+                            "max_x": l_bbox[0] + l_bbox[2],
+                            "min_y": l_bbox[1],
+                            "max_y": l_bbox[1] + l_bbox[3],
+                            "center_x": l_bbox[0] + l_bbox[2] / 2.0,
+                            "center_y": l_bbox[1] + l_bbox[3] / 2.0,
                         })
 
-                    # Add remaining tokens on the same line to the right
-                    for next_tok in line[label_token_idx + 1:]:
-                        if is_any_label(next_tok["text"]):
+        # Step 1.2: For each field, evaluate spatial candidates for its detected labels
+        field_best_candidates: Dict[str, Dict[str, Any]] = {}
+
+        for loc in label_occurrences:
+            f_name = loc["field_name"]
+            line_idx = loc["line_idx"]
+            line = lines[line_idx]
+            end_tok_idx = loc["end_tok_idx"]
+            inline_rem = loc["inline_remainder"]
+            label_max_x = loc["max_x"]
+            label_min_x = loc["min_x"]
+            label_center_x = loc["center_x"]
+            label_center_y = loc["center_y"]
+
+            # Right boundary on the same line (if another label starts to the right)
+            same_line_other_labels = [
+                other for other in label_occurrences
+                if other["line_idx"] == line_idx and other["start_tok_idx"] > end_tok_idx
+            ]
+            same_line_right_limit_x = min([o["min_x"] for o in same_line_other_labels], default=w)
+
+            candidates_for_label = []
+
+            # --- Candidate A: Same-Line Candidates ---
+            same_line_toks = []
+            for tok_idx in range(end_tok_idx + 1, len(line)):
+                tok = line[tok_idx]
+                if tok["min_x"] >= same_line_right_limit_x:
+                    break
+                if is_any_label(tok["text"]):
+                    break
+                if not is_boilerplate(tok["text"]):
+                    same_line_toks.append(tok)
+
+            val_token_groups = []
+            if inline_rem and not is_boilerplate(inline_rem):
+                inline_tok = {
+                    "text": inline_rem,
+                    "conf": line[end_tok_idx]["conf"],
+                    "min_x": label_max_x - 5,
+                    "min_y": loc["min_y"],
+                    "max_x": label_max_x + 50,
+                    "max_y": loc["max_y"],
+                    "bbox": [label_max_x - 5, loc["min_y"], 55, loc["bbox"][3]],
+                    "center_x": label_max_x + 25,
+                    "center_y": label_center_y
+                }
+                # Group 1: inline remainder + following tokens
+                val_token_groups.append(([inline_tok] + same_line_toks, True))
+                # Group 2: inline remainder alone
+                if same_line_toks:
+                    val_token_groups.append(([inline_tok], True))
+            elif same_line_toks:
+                val_token_groups.append((same_line_toks, False))
+
+            for cand_toks, is_inline in val_token_groups:
+                raw_cand_text = " ".join(t["text"].strip() for t in cand_toks).strip(" :-,#.")
+                if not raw_cand_text:
+                    continue
+                is_valid, format_score, norm_val = evaluate_candidate_format(f_name, raw_cand_text)
+                c_bbox = make_merged_bbox(cand_toks)
+                c_min_x = c_bbox[0]
+                c_conf = float(np.mean([t["conf"] for t in cand_toks]))
+
+                score = 0.0
+                # 1. Same-line relationship bonus
+                score += 40.0 if is_inline else 35.0
+
+                # 2. Horizontal distance from label
+                dx = c_min_x - label_max_x
+                if 0 <= dx <= 200:
+                    score += 10.0
+                elif dx > 200:
+                    score -= 0.05 * (dx - 200)
+                elif dx < 0:
+                    score -= 30.0
+
+                # 3. Vertical distance (same line)
+                score += 10.0
+
+                # 4. OCR confidence
+                score += 0.15 * c_conf
+
+                # 5. Format validation score
+                score += format_score
+
+                # 6. Label overlap penalty
+                if any(is_any_label(t["text"]) for t in cand_toks):
+                    score -= 100.0
+
+                # 7. Boilerplate penalty
+                if any(is_boilerplate(t["text"]) for t in cand_toks):
+                    score -= 100.0
+
+                candidates_for_label.append({
+                    "text": norm_val,
+                    "confidence": c_conf,
+                    "bbox": c_bbox,
+                    "score": score,
+                    "is_valid": is_valid,
+                    "rel": "same-line"
+                })
+
+            # --- Candidate B: Next-Line Candidates ---
+            # Evaluated especially when label has no inline value or stands alone on line
+            next_line_indices = [line_idx + 1]
+            if line_idx + 2 < len(lines):
+                # If line_idx + 1 is just another label without values, also check line_idx + 2
+                next_line_indices.append(line_idx + 2)
+
+            for n_idx in next_line_indices:
+                if n_idx >= len(lines):
+                    break
+                target_next_line = lines[n_idx]
+                col_min_x = max(0, label_min_x - 80)
+                col_max_x = same_line_right_limit_x if same_line_right_limit_x < w else w
+
+                next_toks = []
+                for tok in target_next_line:
+                    if col_min_x <= tok["center_x"] <= col_max_x:
+                        if is_any_label(tok["text"]):
                             break
-                        if not is_boilerplate(next_tok["text"]):
-                            val_tokens.append(next_tok)
+                        if not is_boilerplate(tok["text"]):
+                            next_toks.append(tok)
 
-                    # If no valid value tokens were found on same line, look at next line(s)
-                    if not val_tokens and line_idx + 1 < len(lines):
-                        next_line = lines[line_idx + 1]
-                        next_line_text = " ".join(t["text"].strip() for t in next_line)
-                        if not is_any_label(next_line_text) and not is_boilerplate(next_line_text):
-                            for tok in next_line:
-                                if not is_boilerplate(tok["text"]):
-                                    val_tokens.append(tok)
-
-                    # Special handling for multi-line Address: collect continuing lines
-                    if field_name == "Address" and val_tokens:
-                        start_next = line_idx + 1 if inline_remainder or (label_token_idx + 1 < len(line)) else line_idx + 2
-                        for extra_idx in range(start_next, min(start_next + 2, len(lines))):
+                if next_toks:
+                    # For Address: check if following line also continues address
+                    if f_name == "Address" and n_idx + 1 < len(lines):
+                        for extra_idx in range(n_idx + 1, min(n_idx + 3, len(lines))):
                             extra_line = lines[extra_idx]
                             extra_y = sum(t["center_y"] for t in extra_line) / len(extra_line)
                             if extra_y > (0.78 * h):
@@ -309,38 +560,81 @@ class OCRService:
                             extra_text = " ".join(t["text"].strip() for t in extra_line)
                             if is_any_label(extra_text) or is_boilerplate(extra_text):
                                 break
-                            # If it's a date or mostly numbers, stop
                             if re.search(r'\b\d{2}[-/.]\d{2}[-/.]\d{4}\b', extra_text):
                                 break
                             for tok in extra_line:
-                                if not is_boilerplate(tok["text"]):
-                                    val_tokens.append(tok)
+                                if not is_boilerplate(tok["text"]) and not is_any_label(tok["text"]):
+                                    next_toks.append(tok)
 
-                    # If we gathered value tokens, assign the field
-                    if val_tokens:
-                        combined_val = " ".join(t["text"].strip() for t in val_tokens).strip(" :-,")
-                        if field_name == "Full Name":
-                            # Separate concatenated camelCase words (e.g. LaxmiSingh -> Laxmi Singh)
-                            combined_val = re.sub(r'([a-z])([A-Z])', r'\1 \2', combined_val)
-                            # Remove stray punctuation
-                            combined_val = re.sub(r'[^A-Za-z\s\.\'-]', '', combined_val).strip()
-                        elif field_name == "Address":
-                            # Separate camelCase words and digit-letter concatenations (e.g. 123ExampleStreet -> 123 Example Street)
-                            combined_val = re.sub(r'([a-z])([A-Z])', r'\1 \2', combined_val)
-                            combined_val = re.sub(r'([0-9])([A-Za-z])', r'\1 \2', combined_val)
-                            combined_val = re.sub(r'([A-Za-z])([0-9])', r'\1 \2', combined_val)
+                    raw_cand_text = " ".join(t["text"].strip() for t in next_toks).strip(" :-,#.")
+                    if raw_cand_text:
+                        is_valid, format_score, norm_val = evaluate_candidate_format(f_name, raw_cand_text)
+                        c_bbox = make_merged_bbox(next_toks)
+                        c_min_x = c_bbox[0]
+                        c_center_y = c_bbox[1] + c_bbox[3] / 2.0
+                        c_conf = float(np.mean([t["conf"] for t in next_toks]))
 
-                        if len(combined_val) >= 2:
-                            avg_conf = float(np.mean([t["conf"] for t in val_tokens]))
-                            merged_bbox = make_merged_bbox(val_tokens)
-                            parsed[field_name] = {
-                                "value": combined_val,
-                                "confidence": avg_conf,
-                                "bbox": merged_bbox
-                            }
-                            print(f"[OCR Token Parsing] Mapped '{field_name}' via label '{pat}': '{combined_val}' ({avg_conf:.1f}%)")
-                            break
+                        score = 0.0
+                        # 1. Next-line relationship bonus (preferred when no same-line value)
+                        score += 32.0 if not val_token_groups else 20.0
 
+                        # 2. Horizontal distance / column alignment
+                        dx = abs(c_min_x - label_min_x)
+                        if dx <= 80:
+                            score += 15.0
+                        elif dx <= 180:
+                            score += 5.0
+                        else:
+                            score -= 0.1 * (dx - 180)
+
+                        # 3. Vertical distance from label
+                        dy = abs(c_center_y - label_center_y)
+                        line_h = max(15.0, avg_h)
+                        if 0.6 * line_h <= dy <= 2.2 * line_h:
+                            score += 10.0
+                        else:
+                            score -= 8.0 * (dy / line_h)
+
+                        # 4. OCR confidence
+                        score += 0.15 * c_conf
+
+                        # 5. Format validation score
+                        score += format_score
+
+                        # 6. Other label penalty
+                        if any(is_any_label(t["text"]) for t in next_toks):
+                            score -= 100.0
+
+                        # 7. Boilerplate penalty
+                        if any(is_boilerplate(t["text"]) for t in next_toks):
+                            score -= 100.0
+
+                        candidates_for_label.append({
+                            "text": norm_val,
+                            "confidence": c_conf,
+                            "bbox": c_bbox,
+                            "score": score,
+                            "is_valid": is_valid,
+                            "rel": f"next-line(+{n_idx - line_idx})"
+                        })
+
+            # Pick the best valid candidate for this label
+            valid_candidates = [c for c in candidates_for_label if c["is_valid"] and c["score"] >= 35.0]
+            if valid_candidates:
+                valid_candidates.sort(key=lambda c: c["score"], reverse=True)
+                best_c = valid_candidates[0]
+                # Compare against any existing candidate for this field
+                if f_name not in field_best_candidates or best_c["score"] > field_best_candidates[f_name]["score"]:
+                    field_best_candidates[f_name] = best_c
+
+        # Assign parsed fields from winning spatial candidates
+        for f_name, cand in field_best_candidates.items():
+            parsed[f_name] = {
+                "value": cand["text"],
+                "confidence": cand["confidence"],
+                "bbox": cand["bbox"]
+            }
+            print(f"[OCR Spatial Scoring] Assigned '{f_name}' ({cand['rel']}): '{cand['text']}' (score: {cand['score']:.1f}, conf: {cand['confidence']:.1f}%)")
 
         # -------------------------------------------------------------
         # PASS 2: MRZ Line Parsing (standard ICAO Doc 9303 / ID-1 synthetic lines)
@@ -367,7 +661,7 @@ class OCRService:
                                 "bbox": mrz_token["bbox"]
                             }
                             print(f"[OCR Token Parsing] Mapped 'Full Name' via MRZ line: '{clean_name}'")
-                        elif " " not in parsed["Full Name"]["value"] and clean_name.replace(" ", "").upper() == parsed["Full Name"]["value"].upper():
+                        elif clean_name.replace(" ", "").upper() == parsed["Full Name"]["value"].replace(" ", "").upper():
                             parsed["Full Name"]["value"] = clean_name
 
             # MRZ Document number
@@ -384,8 +678,8 @@ class OCRService:
         # PASS 3: Prominent Text Name Fallback (for IDs lacking explicit "NAME:" label)
         # -------------------------------------------------------------
         if parsed["Full Name"]["value"] == "Not detected":
-            # Inspect lines in the demographic zone (between 15% and 70% of document height)
-            candidate_names: List[Tuple[str, float, List[int], float]] = [] # (text, conf, bbox, score)
+            # Inspect lines in the demographic zone (between 12% and 75% of document height)
+            candidate_names: List[Tuple[str, float, List[int], float]] = []  # (text, conf, bbox, score)
             for line in lines:
                 line_y = sum(t["center_y"] for t in line) / len(line)
                 if not (0.12 * h <= line_y <= 0.75 * h):
@@ -394,35 +688,18 @@ class OCRService:
                 line_text = " ".join(t["text"].strip() for t in line).strip(" :-,#")
                 line_upper = line_text.upper()
 
-                # Skip if matches any known label
+                # Skip if matches any known label or boilerplate
                 if is_any_label(line_upper) or is_boilerplate(line_upper):
                     continue
 
-                # Skip lines containing numbers, dates, emails, or urls
-                if re.search(r'\d', line_text) or "@" in line_text or "HTTP" in line_upper:
-                    continue
-
-                # Separate camelCase if any
-                line_clean = re.sub(r'([a-z])([A-Z])', r'\1 \2', line_text)
-                line_clean = re.sub(r'[^A-Za-z\s\.\'-]', '', line_clean).strip()
-                words = [w for w in line_clean.split() if len(w) >= 2]
-
-                # A valid name line has 2 to 4 capitalized/alphabetic words
-                if 2 <= len(words) <= 4:
-                    # Check if words look like a human name (letters only)
-                    all_alpha = all(re.match(r'^[A-Za-z\.\'-]+$', w) for w in words)
-                    if all_alpha:
-                        # Exclude state/authority words
-                        state_words = {"REPUBLIC", "STATE", "DEPARTMENT", "COLLEGE", "UNIVERSITY", "STUDENT", "IDENTITY", "DRIVER", "LICENSE", "LICENCE", "UNION", "AUTHORITY"}
-                        if not any(w.upper() in state_words for w in words):
-                            avg_conf = float(np.mean([t["conf"] for t in line]))
-                            cand_bbox = make_merged_bbox(line)
-                            # Score higher if in upper demographic zone
-                            zone_score = 100.0 - abs(line_y - (0.35 * h)) * 0.1
-                            candidate_names.append((line_clean, avg_conf, cand_bbox, zone_score))
+                is_valid_name, format_score, clean_name = evaluate_candidate_format("Full Name", line_text)
+                if is_valid_name:
+                    avg_conf = float(np.mean([t["conf"] for t in line]))
+                    cand_bbox = make_merged_bbox(line)
+                    zone_score = 100.0 - abs(line_y - (0.35 * h)) * 0.1 + format_score
+                    candidate_names.append((clean_name, avg_conf, cand_bbox, zone_score))
 
             if candidate_names:
-                # Pick the best candidate
                 candidate_names.sort(key=lambda c: (c[3], c[1]), reverse=True)
                 best_name, best_conf, best_bbox, _ = candidate_names[0]
                 parsed["Full Name"] = {
@@ -433,7 +710,7 @@ class OCRService:
                 print(f"[OCR Token Parsing] Mapped 'Full Name' via prominent text fallback: '{best_name}' ({best_conf:.1f}%)")
 
         # -------------------------------------------------------------
-        # PASS 4: Date Regex search for any dates not yet mapped
+        # PASS 4: Date Regex search with Spatial Keyword Proximity
         # -------------------------------------------------------------
         date_regex = re.compile(r'\b(\d{4}[-/.]\d{2}[-/.]\d{2}|\d{2}[-/.]\d{2}[-/.]\d{4})\b')
         unassigned_dates: List[Tuple[str, Dict[str, Any]]] = []
@@ -441,25 +718,37 @@ class OCRService:
             for d in date_regex.findall(token["text"]):
                 unassigned_dates.append((d, token))
 
-        for date_str, d_tok in unassigned_dates:
-            for f_name, keywords in [
-                ("Date of Birth", ["BIRTH", "DOB", "NAISSANCE", "NACIMIENTO", "NATAL"]),
-                ("Issue Date", ["ISSUE", "ISSUED", "EMISSION", "EXPEDICION"]),
-                ("Expiry Date", ["EXPIRY", "EXPIRES", "EXP", "EXPIRATION", "VENCIMIENTO", "VALID"])
-            ]:
+        date_keywords_map = [
+            ("Date of Birth", ["BIRTH", "DOB", "NAISSANCE", "NACIMIENTO", "NATAL"]),
+            ("Issue Date", ["ISSUE", "ISSUED", "EMISSION", "EXPEDICION"]),
+            ("Expiry Date", ["EXPIRY", "EXPIRES", "EXP", "EXPIRATION", "VENCIMIENTO", "VALID"])
+        ]
+
+        assigned_date_tokens = set()
+        for date_idx, (date_str, d_tok) in enumerate(unassigned_dates):
+            if date_idx in assigned_date_tokens:
+                continue
+            _, _, norm_date = evaluate_candidate_format("Date of Birth", date_str)
+            for f_name, keywords in date_keywords_map:
                 if parsed[f_name]["value"] == "Not detected":
-                    nearby = any(
-                        any(k in t["text"].upper() for k in keywords)
-                        for t in tokens
-                        if abs(t["center_y"] - d_tok["center_y"]) < 65
-                    )
-                    if nearby:
+                    best_kw_dist = float("inf")
+                    for t in tokens:
+                        if any(k in t["text"].upper() for k in keywords):
+                            dy = abs(t["center_y"] - d_tok["center_y"])
+                            dx = abs(t["center_x"] - d_tok["center_x"])
+                            if dy < 70 and dx < 400:
+                                dist = dx + 2.0 * dy
+                                if dist < best_kw_dist:
+                                    best_kw_dist = dist
+                    if best_kw_dist < 350:
                         parsed[f_name] = {
-                            "value": date_str,
+                            "value": norm_date,
                             "confidence": d_tok["conf"],
                             "bbox": d_tok["bbox"]
                         }
-                        print(f"[OCR Token Parsing] Mapped '{f_name}' via proximity to keyword: '{date_str}'")
+                        assigned_date_tokens.add(date_idx)
+                        print(f"[OCR Token Parsing] Mapped '{f_name}' via proximity to keyword: '{norm_date}'")
+                        break
 
         # -------------------------------------------------------------
         # PASS 5: ID Number regex fallback if still missing
@@ -478,13 +767,14 @@ class OCRService:
                     m = pat.search(token["text"])
                     if m:
                         matched_id = m.group(1).strip()
-                        if not re.match(r'^\d{2}[-/.]\d{2}[-/.]\d{4}$', matched_id):
+                        is_valid, _, norm_id = evaluate_candidate_format("ID Number", matched_id)
+                        if is_valid:
                             parsed["ID Number"] = {
-                                "value": matched_id,
+                                "value": norm_id,
                                 "confidence": token["conf"],
                                 "bbox": token["bbox"]
                             }
-                            print(f"[OCR Token Parsing] Mapped 'ID Number' via regex fallback: '{matched_id}'")
+                            print(f"[OCR Token Parsing] Mapped 'ID Number' via regex fallback: '{norm_id}'")
                             break
                 if parsed["ID Number"]["value"] != "Not detected":
                     break

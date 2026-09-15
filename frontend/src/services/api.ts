@@ -3,7 +3,7 @@ import { AnalyzeResponse, HealthStatus, HistoryItem, SampleDocument } from '../t
 import { compressDocumentBase64, compressDocumentFile, sanitizeUploadErrorMessage } from './imageCompressor';
 
 // Hardcoded target for mobile network testing per instructions
-const MOBILE_TARGET_URL = 'http://10.90.130.149:8000/api';
+const MOBILE_TARGET_URL = 'http://192.168.43.149:8000/api';
 
 export const getApiBaseUrl = (): string => {
   // If running inside Capacitor (native Android app)
