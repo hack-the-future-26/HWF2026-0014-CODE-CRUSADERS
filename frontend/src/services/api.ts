@@ -1,27 +1,32 @@
-import { Capacitor } from '@capacitor/core';
 import { AnalyzeResponse, HealthStatus, HistoryItem, SampleDocument } from '../types';
 import { compressDocumentBase64, compressDocumentFile, sanitizeUploadErrorMessage } from './imageCompressor';
 
-// Hardcoded target for mobile network testing per instructions
-const MOBILE_TARGET_URL = 'http://192.168.43.149:8000/api';
+const normalizeApiUrl = (url: string): string => {
+  let cleaned = url.trim().replace(/\/+$/, '');
+  if (!cleaned.endsWith('/api')) {
+    cleaned += '/api';
+  }
+  return cleaned;
+};
 
 export const getApiBaseUrl = (): string => {
-  // If running inside Capacitor (native Android app)
-  if (Capacitor.isNativePlatform()) {
-    return MOBILE_TARGET_URL;
+  // 1. Check runtime localStorage override if present
+  try {
+    const localUrl = localStorage.getItem('idshield_api_base');
+    if (localUrl && localUrl.trim()) {
+      return normalizeApiUrl(localUrl);
+    }
+  } catch {
+    // localStorage may be inaccessible in certain security contexts
   }
 
-  // Check build-time environment variable (e.g. from .env)
+  // 2. Check build-time environment variable (e.g. from .env)
   const envUrl = (import.meta as any).env?.VITE_API_BASE_URL || (import.meta as any).env?.VITE_API_URL;
   if (envUrl && typeof envUrl === 'string' && envUrl.trim()) {
-    let cleaned = envUrl.trim().replace(/\/+$/, '');
-    if (!cleaned.endsWith('/api')) {
-      cleaned += '/api';
-    }
-    return cleaned;
+    return normalizeApiUrl(envUrl);
   }
 
-  // In browser, default to /api which Vite proxies to backend
+  // 3. Fallback to /api (for Vite proxy during local web development)
   return '/api';
 };
 
@@ -49,7 +54,7 @@ const handleFetchError = (endpoint: string, err: any): never => {
   }
 
   if (err instanceof TypeError && (err.message.includes('fetch') || err.message.includes('NetworkError') || err.message.includes('Failed to fetch'))) {
-    throw new Error(`Analysis service unavailable (${fullUrl}). Check network connection and verify backend is running on http://10.90.130.149:8000.`);
+    throw new Error(`Analysis service unavailable (${fullUrl}). Please check your internet connection and verify that the backend service is running.`);
   }
   throw err;
 };
